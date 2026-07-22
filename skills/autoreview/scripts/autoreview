@@ -1792,9 +1792,14 @@ def systemd_command_expansion_compatibility(
     version: int,
     payload: list[str],
 ) -> tuple[list[str], list[str]]:
-    if version >= SYSTEMD_EXPAND_ENVIRONMENT_MIN_VERSION:
-        return ["--expand-environment=no"], payload
-    return [], [argument.replace("$", "$$") for argument in payload]
+    if version < SYSTEMD_EXPAND_ENVIRONMENT_MIN_VERSION:
+        raise RuntimeError(
+            "systemd-run version "
+            f"{version} is unsupported; version "
+            f"{SYSTEMD_EXPAND_ENVIRONMENT_MIN_VERSION} or newer is required "
+            "for secret-safe environment transfer"
+        )
+    return ["--expand-environment=no"], payload
 
 
 def systemd_runtime_max_seconds(args: argparse.Namespace) -> int:
@@ -1855,6 +1860,14 @@ def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
     if not SYSTEMCTL_PATH.is_file() or not os.access(SYSTEMCTL_PATH, os.X_OK):
         raise SystemExit(f"required WSL lifecycle containment is unavailable: {SYSTEMCTL_PATH}")
 
+    try:
+        expansion_options, payload = systemd_command_expansion_compatibility(
+            systemd_run_version(),
+            [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+    except RuntimeError as exc:
+        raise SystemExit(f"required WSL lifecycle containment is unavailable: {exc}") from exc
+
     suffix = hashlib.sha256(
         f"{Path.cwd().resolve()}\0{os.getpid()}\0{time.time_ns()}".encode("utf-8")
     ).hexdigest()[:12]
@@ -1870,10 +1883,6 @@ def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
     result_path = result_root / "result.json"
     env[SYSTEMD_RESULT_PATH_ENV] = str(result_path)
     runtime_max_seconds = systemd_runtime_max_seconds(args)
-    expansion_options, payload = systemd_command_expansion_compatibility(
-        systemd_run_version(),
-        [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
-    )
     command = [
         str(SYSTEMD_RUN_PATH),
         "--user",

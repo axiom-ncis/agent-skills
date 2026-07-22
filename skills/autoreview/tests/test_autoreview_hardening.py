@@ -4694,17 +4694,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 600,
         )
 
-    def test_systemd_253_escapes_dollars_without_newer_option(self) -> None:
-        options, payload = self.helper["systemd_command_expansion_compatibility"](
-            253,
-            ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"],
-        )
-
-        self.assertEqual(options, [])
-        self.assertEqual(
-            payload,
-            ["/tmp/$$repo/autoreview", "--prompt=$$HOME", "plain"],
-        )
+    def test_systemd_253_fails_closed_without_secret_safe_environment_transfer(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "version 254 or newer"):
+            self.helper["systemd_command_expansion_compatibility"](
+                253,
+                ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"],
+            )
 
     def test_systemd_254_disables_expansion_and_preserves_payload(self) -> None:
         original = ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"]
@@ -4727,6 +4722,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with mock.patch("subprocess.run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "unrecognized version output"):
                 self.helper["systemd_run_version"]()
+
+    def test_unsupported_systemd_version_fails_before_result_staging(self) -> None:
+        enter = self.helper["enter_wsl_systemd_containment"]
+        args = argparse.Namespace()
+        with mock.patch.dict(
+            enter.__globals__,
+            {
+                "SYSTEMD_RUN_PATH": Path(sys.executable),
+                "SYSTEMCTL_PATH": Path(sys.executable),
+                "verify_declared_systemd_containment": lambda: False,
+                "wsl_runtime": lambda: True,
+                "systemd_run_version": lambda: 253,
+            },
+        ), mock.patch("tempfile.mkdtemp") as mkdtemp:
+            with self.assertRaisesRegex(SystemExit, "version 254 or newer"):
+                enter(args)
+        mkdtemp.assert_not_called()
 
     def test_systemd_query_failure_is_not_treated_as_inactive(self) -> None:
         failure = subprocess.CompletedProcess(
