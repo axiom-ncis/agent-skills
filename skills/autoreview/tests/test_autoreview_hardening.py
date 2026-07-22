@@ -4694,6 +4694,40 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 600,
         )
 
+    def test_systemd_253_escapes_dollars_without_newer_option(self) -> None:
+        options, payload = self.helper["systemd_command_expansion_compatibility"](
+            253,
+            ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"],
+        )
+
+        self.assertEqual(options, [])
+        self.assertEqual(
+            payload,
+            ["/tmp/$$repo/autoreview", "--prompt=$$HOME", "plain"],
+        )
+
+    def test_systemd_254_disables_expansion_and_preserves_payload(self) -> None:
+        original = ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"]
+
+        options, payload = self.helper["systemd_command_expansion_compatibility"](
+            254,
+            original,
+        )
+
+        self.assertEqual(options, ["--expand-environment=no"])
+        self.assertIs(payload, original)
+
+    def test_systemd_run_version_fails_closed_on_unrecognized_output(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["systemd-run", "--version"],
+            0,
+            "unknown service manager\n",
+            "",
+        )
+        with mock.patch("subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "unrecognized version output"):
+                self.helper["systemd_run_version"]()
+
     def test_systemd_query_failure_is_not_treated_as_inactive(self) -> None:
         failure = subprocess.CompletedProcess(
             ["systemctl"],

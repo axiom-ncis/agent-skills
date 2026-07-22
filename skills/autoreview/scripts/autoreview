@@ -46,6 +46,7 @@ ACTIVE_MANAGED_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 POSIX_SUBREAPER_ENABLED = False
 SYSTEMD_RUN_PATH = Path('/usr/bin/systemd-run')
 SYSTEMCTL_PATH = Path('/usr/bin/systemctl')
+SYSTEMD_EXPAND_ENVIRONMENT_MIN_VERSION = 254
 SYSTEMD_UNIT_ENV = 'AUTOREVIEW_SYSTEMD_UNIT'
 SYSTEMD_CONTAINMENT_ENV = 'AUTOREVIEW_SYSTEMD_CONTAINMENT'
 SYSTEMD_RESULT_PATH_ENV = 'AUTOREVIEW_SYSTEMD_RESULT_PATH'
@@ -1766,6 +1767,36 @@ def systemd_environment_names(env: dict[str, str]) -> list[str]:
     )
 
 
+def systemd_run_version() -> int:
+    try:
+        result = subprocess.run(
+            [str(SYSTEMD_RUN_PATH), "--version"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot determine systemd-run version: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"status {result.returncode}"
+        raise RuntimeError(f"cannot determine systemd-run version: {detail}")
+    match = re.search(r"(?m)^systemd\s+(\d+)\b", result.stdout)
+    if not match:
+        raise RuntimeError("cannot determine systemd-run version: unrecognized version output")
+    return int(match.group(1))
+
+
+def systemd_command_expansion_compatibility(
+    version: int,
+    payload: list[str],
+) -> tuple[list[str], list[str]]:
+    if version >= SYSTEMD_EXPAND_ENVIRONMENT_MIN_VERSION:
+        return ["--expand-environment=no"], payload
+    return [], [argument.replace("$", "$$") for argument in payload]
+
+
 def systemd_runtime_max_seconds(args: argparse.Namespace) -> int:
     review_budget = (
         int(args.review_timeout_seconds)
@@ -1839,6 +1870,10 @@ def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
     result_path = result_root / "result.json"
     env[SYSTEMD_RESULT_PATH_ENV] = str(result_path)
     runtime_max_seconds = systemd_runtime_max_seconds(args)
+    expansion_options, payload = systemd_command_expansion_compatibility(
+        systemd_run_version(),
+        [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
     command = [
         str(SYSTEMD_RUN_PATH),
         "--user",
@@ -1847,7 +1882,7 @@ def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
         "--wait",
         "--collect",
         "--service-type=exec",
-        "--expand-environment=no",
+        *expansion_options,
         f"--unit={unit}",
         "--property=KillMode=control-group",
         f"--property=TimeoutStopSec={args.termination_grace_seconds}s",
@@ -1855,9 +1890,7 @@ def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
         f"--property=RuntimeMaxSec={runtime_max_seconds}s",
         f"--working-directory={Path.cwd().resolve()}",
         *(f"--setenv={name}" for name in systemd_environment_names(env)),
-        sys.executable,
-        str(Path(__file__).resolve()),
-        *sys.argv[1:],
+        *payload,
     ]
     proc = subprocess.Popen(command, env=env, start_new_session=True)
     previous_handlers: dict[int, Any] = {}
