@@ -1866,33 +1866,35 @@ def process_exists(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def posix_process_group_pids(process_group: int) -> list[int]:
-    if not sys.platform.startswith("linux"):
-        return []
-    members: list[int] = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat_text = (entry / "stat").read_text()
-            fields = stat_text[stat_text.rfind(") ") + 2:].split()
-            if int(fields[2]) == process_group:
-                members.append(int(entry.name))
-        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
-            continue
-    return members
-
-
-def reap_posix_process_group(process_group: int, timeout_seconds: int) -> None:
+def reap_posix_process_group(
+    process_group: int,
+    timeout_seconds: int,
+    *,
+    leader_pid: int | None = None,
+) -> None:
     if not sys.platform.startswith("linux") or not POSIX_SUBREAPER_ENABLED:
         return
     deadline = time.monotonic() + timeout_seconds
     while True:
-        members = posix_process_group_pids(process_group)
-        if not members:
-            return
         reaped = False
-        for pid in members:
+        while True:
+            try:
+                status = os.waitid(
+                    os.P_PGID,
+                    process_group,
+                    os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                )
+            except (ChildProcessError, ProcessLookupError, OSError):
+                # Reaping is best-effort and must never interrupt TERM/KILL
+                # escalation. waitid is independent of procfs availability.
+                return
+            if status is None or status.si_pid == 0:
+                break
+            pid = int(status.si_pid)
+            # Popen owns the leader's wait status. WNOWAIT lets us inspect the
+            # result without stealing it when leader exit races with poll().
+            if pid == leader_pid:
+                return
             try:
                 waited_pid, _status = os.waitpid(pid, os.WNOHANG)
                 reaped = reaped or waited_pid == pid
@@ -1971,7 +1973,7 @@ def terminate_managed_process(
         deadline = time.monotonic() + grace_seconds
         while time.monotonic() < deadline:
             proc.poll()
-            reap_posix_process_group(proc.pid, 0)
+            reap_posix_process_group(proc.pid, 0, leader_pid=proc.pid)
             if not managed_process_group_alive(proc):
                 break
             time.sleep(0.05)
@@ -1999,7 +2001,11 @@ def terminate_managed_process(
                 flush=True,
             )
     if os.name != "nt":
-        reap_posix_process_group(proc.pid, max(1, grace_seconds))
+        reap_posix_process_group(
+            proc.pid,
+            max(1, grace_seconds),
+            leader_pid=proc.pid,
+        )
     return action
 
 
@@ -11706,7 +11712,10 @@ def start_parallel_tests(
     setattr(proc, "_autoreview_test_home", test_home)
     setattr(proc, "_autoreview_stderr_thread", stderr_thread)
     setattr(proc, "_autoreview_timed_out", False)
+    setattr(proc, "_autoreview_descendant_leak", False)
     setattr(proc, "_autoreview_termination_action", None)
+    lifecycle_lock = threading.Lock()
+    setattr(proc, "_autoreview_lifecycle_lock", lifecycle_lock)
     managed = isinstance(proc.pid, int) and proc.pid > 0
     setattr(proc, "_autoreview_managed", managed)
     if not managed:
@@ -11714,16 +11723,55 @@ def start_parallel_tests(
     register_managed_process(proc)
 
     def timeout_parallel_tests() -> None:
-        if not managed_process_group_alive(proc):
-            return
-        setattr(proc, "_autoreview_timed_out", True)
-        setattr(proc, "_autoreview_termination_action", "in-progress")
+        with lifecycle_lock:
+            # Reap a completed leader before consulting the process group. On
+            # POSIX an unreaped successful leader is still visible as a zombie
+            # and must not be converted into a timeout.
+            proc.poll()
+            if proc.returncode is not None:
+                return
+            if getattr(proc, "_autoreview_descendant_leak", False):
+                return
+            if not managed_process_group_alive(proc):
+                return
+            setattr(proc, "_autoreview_timed_out", True)
+            setattr(proc, "_autoreview_termination_action", "in-progress")
         action = terminate_managed_process(
             proc,
             label="parallel tests",
             grace_seconds=termination_grace_seconds,
         )
-        setattr(proc, "_autoreview_termination_action", action)
+        with lifecycle_lock:
+            setattr(proc, "_autoreview_termination_action", action)
+
+    def monitor_parallel_test_leader() -> None:
+        proc.wait()
+        if os.name != "nt":
+            reap_posix_process_group(proc.pid, 0, leader_pid=proc.pid)
+        if not managed_process_group_alive(proc):
+            return
+        with lifecycle_lock:
+            if getattr(proc, "_autoreview_timed_out", False):
+                return
+            if getattr(proc, "_autoreview_termination_action", None) == "in-progress":
+                return
+            setattr(proc, "_autoreview_descendant_leak", True)
+            setattr(proc, "_autoreview_termination_action", "in-progress")
+        action = terminate_managed_process(
+            proc,
+            label="parallel test descendant cleanup",
+            grace_seconds=termination_grace_seconds,
+        )
+        with lifecycle_lock:
+            setattr(proc, "_autoreview_termination_action", action)
+
+    leader_watcher = threading.Thread(
+        target=monitor_parallel_test_leader,
+        name=f"autoreview-parallel-leader-{proc.pid}",
+        daemon=True,
+    )
+    leader_watcher.start()
+    setattr(proc, "_autoreview_leader_watcher", leader_watcher)
 
     timeout_timer = threading.Timer(timeout_seconds, timeout_parallel_tests)
     timeout_timer.daemon = True
@@ -11752,29 +11800,29 @@ def relay_parallel_test_stderr(stream: Any, java_tool_options: str) -> None:
 def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
     try:
         proc.wait()
-        timeout_timer = getattr(proc, "_autoreview_timeout_timer", None)
-        if isinstance(timeout_timer, threading.Timer):
-            if getattr(proc, "_autoreview_timed_out", False):
-                grace_seconds = getattr(
-                    proc,
-                    "_autoreview_termination_grace_seconds",
-                    DEFAULT_TERMINATION_GRACE_SECONDS,
-                )
-                timeout_timer.join(timeout=(grace_seconds * 2) + 2)
-            else:
-                timeout_timer.cancel()
-                timeout_timer.join(timeout=0.25)
-        timed_out = getattr(proc, "_autoreview_timed_out", False) is True
-        action = getattr(proc, "_autoreview_termination_action", None)
-        descendant_leak = False
         managed = getattr(proc, "_autoreview_managed", False) is True
         configured_grace_seconds = getattr(
             proc,
             "_autoreview_termination_grace_seconds",
             DEFAULT_TERMINATION_GRACE_SECONDS,
         )
+        if not isinstance(configured_grace_seconds, (int, float)):
+            configured_grace_seconds = DEFAULT_TERMINATION_GRACE_SECONDS
+        lifecycle_join_seconds = (configured_grace_seconds * 3) + 3
+        timeout_timer = getattr(proc, "_autoreview_timeout_timer", None)
+        if isinstance(timeout_timer, threading.Timer):
+            timeout_timer.cancel()
+            timeout_timer.join(timeout=lifecycle_join_seconds)
+        leader_watcher = getattr(proc, "_autoreview_leader_watcher", None)
+        if isinstance(leader_watcher, threading.Thread):
+            leader_watcher.join(timeout=lifecycle_join_seconds)
+        timed_out = getattr(proc, "_autoreview_timed_out", False) is True
+        action = getattr(proc, "_autoreview_termination_action", None)
+        descendant_leak = getattr(proc, "_autoreview_descendant_leak", False) is True
+        descendant_cleanup_reported = False
         if managed and not timed_out and managed_process_group_alive(proc):
             descendant_leak = True
+            setattr(proc, "_autoreview_descendant_leak", True)
             action = terminate_managed_process(
                 proc,
                 label="parallel test descendant cleanup",
@@ -11784,9 +11832,42 @@ def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
                 f"tests lifecycle failure: descendants survived; termination={action}",
                 file=sys.stderr,
             )
+            descendant_cleanup_reported = True
+        if descendant_leak and not descendant_cleanup_reported:
+            print(
+                f"tests lifecycle failure: leader exited but descendants survived; "
+                f"termination={action}",
+                file=sys.stderr,
+            )
+        tree_alive = bool(managed and managed_process_group_alive(proc))
+        lifecycle_thread_failed = bool(
+            managed
+            and (
+                (
+                    isinstance(timeout_timer, threading.Timer)
+                    and timeout_timer.is_alive()
+                )
+                or (
+                    isinstance(leader_watcher, threading.Thread)
+                    and leader_watcher.is_alive()
+                )
+                or tree_alive
+            )
+        )
+        if lifecycle_thread_failed:
+            print(
+                "tests lifecycle failure: managed cleanup did not converge",
+                file=sys.stderr,
+            )
         stderr_thread = getattr(proc, "_autoreview_stderr_thread", None)
         if isinstance(stderr_thread, threading.Thread):
-            stderr_thread.join(timeout=configured_grace_seconds if managed else 0.25)
+            if managed and not tree_alive:
+                # With the complete tree gone, the pipe must reach EOF. Do not
+                # abandon buffered diagnostics merely because relaying them is
+                # slower than the process-termination grace period.
+                stderr_thread.join()
+            else:
+                stderr_thread.join(timeout=0.25)
         stderr_drain_failed = bool(
             managed
             and isinstance(stderr_thread, threading.Thread)
@@ -11812,7 +11893,7 @@ def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
                 file=sys.stderr,
             )
             status = TIMEOUT_EXIT_CODE
-        elif descendant_leak or stderr_drain_failed:
+        elif descendant_leak or stderr_drain_failed or lifecycle_thread_failed:
             status = DESCENDANT_LEAK_EXIT_CODE
         else:
             status = int(proc.returncode or 0)

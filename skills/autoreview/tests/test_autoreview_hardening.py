@@ -4545,6 +4545,84 @@ class AutoreviewHardeningTests(unittest.TestCase):
             release.set()
             stderr_thread.join(timeout=1)
 
+    def test_managed_parallel_test_waits_for_stderr_eof_after_tree_exit(self) -> None:
+        relayed: list[str] = []
+
+        def delayed_relay() -> None:
+            time.sleep(0.4)
+            relayed.append("stderr-tail")
+
+        stderr_thread = threading.Thread(target=delayed_relay, daemon=True)
+        stderr_thread.start()
+        with tempfile.TemporaryDirectory() as tempdir:
+            test_home = Path(tempdir) / "test-home"
+            test_home.mkdir()
+            proc = mock.Mock()
+            proc.pid = 321
+            proc.returncode = 0
+            proc.wait.return_value = 0
+            proc.stderr = io.StringIO("")
+            setattr(proc, "_autoreview_test_home", test_home)
+            setattr(proc, "_autoreview_stderr_thread", stderr_thread)
+            setattr(proc, "_autoreview_managed", True)
+            setattr(proc, "_autoreview_timed_out", False)
+            setattr(proc, "_autoreview_descendant_leak", False)
+            setattr(proc, "_autoreview_termination_action", None)
+            setattr(proc, "_autoreview_termination_grace_seconds", 0.05)
+
+            before = time.monotonic()
+            with mock.patch.dict(
+                self.helper["finish_parallel_tests"].__globals__,
+                {"managed_process_group_alive": lambda _proc: False},
+            ), mock.patch.dict(
+                self.helper["unregister_managed_process"].__globals__,
+                {"close_windows_job": lambda _proc: None},
+            ):
+                result = self.helper["finish_parallel_tests"](proc, time.time())
+            elapsed = time.monotonic() - before
+
+        self.assertEqual(result, 0)
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertEqual(relayed, ["stderr-tail"])
+        self.assertFalse(stderr_thread.is_alive())
+
+    @unittest.skipIf(os.name == "nt", "POSIX waitpid ownership")
+    def test_descendant_reaper_never_reaps_popen_leader(self) -> None:
+        leader_status = mock.Mock(si_pid=101)
+        waitid = mock.Mock(return_value=leader_status)
+        waitpid = mock.Mock()
+        with mock.patch.dict(
+            self.helper["reap_posix_process_group"].__globals__,
+            {"POSIX_SUBREAPER_ENABLED": True},
+        ), mock.patch("os.waitid", waitid), mock.patch("os.waitpid", waitpid):
+            self.helper["reap_posix_process_group"](
+                101,
+                0,
+                leader_pid=101,
+            )
+        waitid.assert_called_once_with(
+            os.P_PGID,
+            101,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        waitpid.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX waitpid ownership")
+    def test_descendant_reaper_uses_process_group_wait_without_procfs(self) -> None:
+        child_status = mock.Mock(si_pid=202)
+        waitid = mock.Mock(side_effect=[child_status, None])
+        waitpid = mock.Mock(return_value=(202, 0))
+        with mock.patch.dict(
+            self.helper["reap_posix_process_group"].__globals__,
+            {"POSIX_SUBREAPER_ENABLED": True},
+        ), mock.patch("os.waitid", waitid), mock.patch("os.waitpid", waitpid):
+            self.helper["reap_posix_process_group"](
+                101,
+                0,
+                leader_pid=101,
+            )
+        waitpid.assert_called_once_with(202, os.WNOHANG)
+
     def test_managed_process_platform_flags_cover_posix_and_native_windows(self) -> None:
         self.assertEqual(
             self.helper["managed_popen_kwargs"]("posix"),
@@ -4719,6 +4797,63 @@ time.sleep(60)
             with self.assertRaises(ProcessLookupError):
                 os.kill(grandchild_pid, 0)
             self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_completed_parallel_test_is_not_timed_out_before_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            fixture = Path(tempdir) / "parallel_success.py"
+            fixture.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            proc, started = self.helper["start_parallel_tests"](
+                f"{sys.executable} {fixture}",
+                repo,
+                "default",
+                timeout_seconds=0.25,
+                termination_grace_seconds=1,
+            )
+            time.sleep(0.6)
+            status = self.helper["finish_parallel_tests"](proc, started)
+
+        self.assertEqual(status, 0)
+        self.assertFalse(getattr(proc, "_autoreview_timed_out"))
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_parallel_leader_exit_cleans_descendant_before_hard_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            pid_file = root / "parallel_leader_exit.pid"
+            fixture = root / "parallel_leader_exit.py"
+            fixture.write_text(
+                "import pathlib,subprocess,sys\n"
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n",
+                encoding="utf-8",
+            )
+            started_at = time.monotonic()
+            proc, started = self.helper["start_parallel_tests"](
+                f"{sys.executable} {fixture}",
+                repo,
+                "default",
+                timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+            deadline = time.monotonic() + 4
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text())
+            while self.helper["process_exists"](child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self.helper["process_exists"](child_pid))
+            self.assertLess(time.monotonic() - started_at, 4)
+            status = self.helper["finish_parallel_tests"](proc, started)
+
+        self.assertEqual(status, self.helper["DESCENDANT_LEAK_EXIT_CODE"])
+        self.assertFalse(getattr(proc, "_autoreview_timed_out"))
+        self.assertTrue(getattr(proc, "_autoreview_descendant_leak"))
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
 
     def test_source_tree_snapshot_detects_parallel_test_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
