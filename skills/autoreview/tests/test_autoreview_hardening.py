@@ -4545,6 +4545,181 @@ class AutoreviewHardeningTests(unittest.TestCase):
             release.set()
             stderr_thread.join(timeout=1)
 
+    def test_managed_process_platform_flags_cover_posix_and_native_windows(self) -> None:
+        self.assertEqual(
+            self.helper["managed_popen_kwargs"]("posix"),
+            {"start_new_session": True},
+        )
+        self.assertEqual(
+            self.helper["managed_popen_kwargs"]("nt"),
+            {"creationflags": 0x00000204},
+        )
+
+    def test_review_engine_normal_completion_is_reaped(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", "print('managed-normal')"],
+                Path(tempdir),
+                label="managed-normal",
+                heartbeat_seconds=1,
+                timeout_seconds=5,
+                termination_grace_seconds=1,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "managed-normal")
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_review_engine_timeout_kills_term_ignoring_grandchild_and_keeps_stderr(self) -> None:
+        parent_source = """
+import signal
+import subprocess
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([
+    sys.executable,
+    '-c',
+    'import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+    'print(\"grandchild-ready\", file=sys.stderr, flush=True); time.sleep(60)',
+])
+print(f'grandchild-pid={child.pid}', file=sys.stderr, flush=True)
+time.sleep(60)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", parent_source],
+                Path(tempdir),
+                label="managed-timeout",
+                heartbeat_seconds=1,
+                timeout_seconds=1,
+                termination_grace_seconds=1,
+            )
+        self.assertEqual(result.returncode, self.helper["TIMEOUT_EXIT_CODE"])
+        self.assertTrue(getattr(result, "timed_out"))
+        self.assertEqual(getattr(result, "termination_action"), "SIGKILL")
+        self.assertIn("grandchild-ready", result.stderr)
+        self.assertIn("timed out after 1s", result.stderr)
+        match = re.search(r"grandchild-pid=(\d+)", result.stderr)
+        self.assertIsNotNone(match)
+        grandchild_pid = int(match.group(1))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(grandchild_pid, 0)
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_exited_engine_leader_cleans_descendant_without_waiting_for_hard_timeout(self) -> None:
+        leader_source = """
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(f'lingering-pid={child.pid}', file=sys.stderr, flush=True)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            started = time.monotonic()
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", leader_source],
+                Path(tempdir),
+                label="leader-exit",
+                heartbeat_seconds=1,
+                timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, self.helper["DESCENDANT_LEAK_EXIT_CODE"])
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertLess(elapsed, 4)
+        self.assertIn("leader exited but descendants survived", result.stderr)
+        lingering_pid = int(re.search(r"lingering-pid=(\d+)", result.stderr).group(1))
+        self.assertFalse(self.helper["process_exists"](lingering_pid))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_streaming_exited_leader_cleans_descendant_before_pipe_eof(self) -> None:
+        leader_source = """
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(f'stream-lingering-pid={child.pid}', file=sys.stderr, flush=True)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", leader_source],
+                Path(tempdir),
+                label="stream-leader-exit",
+                heartbeat_seconds=1,
+                timeout_seconds=10,
+                termination_grace_seconds=1,
+                stream_output=True,
+                stream_display=lambda _name, _line: None,
+            )
+        self.assertEqual(result.returncode, self.helper["DESCENDANT_LEAK_EXIT_CODE"])
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertIn("leader exited but descendants survived", result.stderr)
+        lingering_pid = int(re.search(r"stream-lingering-pid=(\d+)", result.stderr).group(1))
+        self.assertFalse(self.helper["process_exists"](lingering_pid))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_cooperative_timeout_stays_sigterm_and_reaps_during_grace(self) -> None:
+        parent_source = """
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(f'cooperative-pid={child.pid}', file=sys.stderr, flush=True)
+time.sleep(60)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            started = time.monotonic()
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", parent_source],
+                Path(tempdir),
+                label="cooperative-timeout",
+                heartbeat_seconds=1,
+                timeout_seconds=1,
+                termination_grace_seconds=3,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, self.helper["TIMEOUT_EXIT_CODE"])
+        self.assertEqual(getattr(result, "termination_action"), "SIGTERM")
+        self.assertLess(elapsed, 3)
+        cooperative_pid = int(re.search(r"cooperative-pid=(\d+)", result.stderr).group(1))
+        self.assertFalse(self.helper["process_exists"](cooperative_pid))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_parallel_test_timeout_kills_complete_shell_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            pid_file = root / "grandchild.pid"
+            fixture = root / "parallel_hang.py"
+            fixture.write_text(
+                "import pathlib,signal,subprocess,sys,time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "child=subprocess.Popen([sys.executable,'-c',"
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            proc, started = self.helper["start_parallel_tests"](
+                f"{sys.executable} {fixture}",
+                repo,
+                "default",
+                timeout_seconds=1,
+                termination_grace_seconds=1,
+            )
+            status = self.helper["finish_parallel_tests"](proc, started)
+            self.assertEqual(status, self.helper["TIMEOUT_EXIT_CODE"])
+            grandchild_pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(grandchild_pid, 0)
+            self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
     def test_source_tree_snapshot_detects_parallel_test_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
