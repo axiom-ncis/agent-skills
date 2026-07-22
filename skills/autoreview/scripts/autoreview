@@ -344,6 +344,7 @@ MAX_BUNDLE_TEXT_BYTES = 180_000
 MAX_REVIEW_PROMPT_BYTES = 512_000
 MAX_REVIEW_CHUNK_CONTEXT_BYTES = 64_000
 MAX_REVIEW_PASSES = 8
+MAX_REVIEW_ATTEMPTS_PER_PASS = 3
 
 
 class ReviewChunk(NamedTuple):
@@ -1694,8 +1695,24 @@ def systemd_unit_active(unit: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"cannot query Autoreview systemd unit {unit}: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"status {result.returncode}"
+        raise RuntimeError(f"cannot query Autoreview systemd unit {unit}: {detail}")
     state = result.stdout.strip()
-    return state in {"active", "activating", "reloading", "deactivating"}
+    if state in {"inactive", "failed"}:
+        return False
+    if state in {
+        "active",
+        "activating",
+        "reloading",
+        "deactivating",
+        "maintenance",
+        "refreshing",
+    }:
+        return True
+    raise RuntimeError(
+        f"cannot query Autoreview systemd unit {unit}: unexpected ActiveState {state!r}"
+    )
 
 
 def signal_systemd_unit(unit: str, signal_name: str) -> None:
@@ -1747,6 +1764,16 @@ def systemd_environment_names(env: dict[str, str]) -> list[str]:
         for name, value in env.items()
         if value is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
     )
+
+
+def systemd_runtime_max_seconds(args: argparse.Namespace) -> int:
+    review_budget = (
+        int(args.review_timeout_seconds)
+        * MAX_REVIEW_PASSES
+        * MAX_REVIEW_ATTEMPTS_PER_PASS
+    )
+    command_budget = max(review_budget, int(args.parallel_tests_timeout_seconds))
+    return command_budget + int(args.termination_grace_seconds) + 600
 
 
 def read_systemd_result(path: Path, unit: str) -> int | None:
@@ -1811,13 +1838,7 @@ def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
     result_root.chmod(0o700)
     result_path = result_root / "result.json"
     env[SYSTEMD_RESULT_PATH_ENV] = str(result_path)
-    maximum_command_timeout = max(
-        int(args.review_timeout_seconds),
-        int(args.parallel_tests_timeout_seconds),
-    )
-    runtime_max_seconds = (maximum_command_timeout * 4) + int(
-        args.termination_grace_seconds
-    ) + 600
+    runtime_max_seconds = systemd_runtime_max_seconds(args)
     command = [
         str(SYSTEMD_RUN_PATH),
         "--user",
@@ -2537,7 +2558,7 @@ def run_with_stream(
     pipes_drained = True
     try:
         open_streams = 2
-        while open_streams:
+        while True:
             leader_returncode = proc.poll()
             if (
                 not timed_out
@@ -2583,6 +2604,8 @@ def run_with_stream(
                             stream.close()
                         except OSError:
                             pass
+                break
+            if open_streams == 0 and proc.poll() is not None:
                 break
             wait_seconds = heartbeat_seconds if timed_out else min(heartbeat_seconds, max(0.01, remaining))
             if drain_deadline is not None:

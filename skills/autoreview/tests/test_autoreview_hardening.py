@@ -4673,6 +4673,38 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "does not match"):
                 verify()
 
+    def test_systemd_runtime_budget_covers_every_bounded_review_pass(self) -> None:
+        args = argparse.Namespace(
+            review_timeout_seconds=10,
+            parallel_tests_timeout_seconds=100,
+            termination_grace_seconds=5,
+        )
+
+        result = self.helper["systemd_runtime_max_seconds"](args)
+
+        self.assertEqual(
+            result,
+            max(
+                10
+                * self.helper["MAX_REVIEW_PASSES"]
+                * self.helper["MAX_REVIEW_ATTEMPTS_PER_PASS"],
+                100,
+            )
+            + 5
+            + 600,
+        )
+
+    def test_systemd_query_failure_is_not_treated_as_inactive(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["systemctl"],
+            1,
+            "",
+            "Failed to connect to bus",
+        )
+        with mock.patch("subprocess.run", return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, "Failed to connect to bus"):
+                self.helper["systemd_unit_active"]("autoreview-test.service")
+
     def test_review_engine_normal_completion_is_reaped(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             result = self.helper["run_with_heartbeat"](
@@ -4779,6 +4811,34 @@ print(f'stream-lingering-pid={child.pid}', file=sys.stderr, flush=True)
         self.assertIn("leader exited but descendants survived", result.stderr)
         lingering_pid = int(re.search(r"stream-lingering-pid=(\d+)", result.stderr).group(1))
         self.assertFalse(self.helper["process_exists"](lingering_pid))
+
+    def test_streaming_engine_may_close_both_pipes_before_normal_exit(self) -> None:
+        leader_source = """
+import os
+import time
+
+os.close(1)
+os.close(2)
+time.sleep(1.5)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            started = time.monotonic()
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", leader_source],
+                Path(tempdir),
+                label="stream-early-eof",
+                heartbeat_seconds=0.1,
+                timeout_seconds=5,
+                termination_grace_seconds=0.1,
+                stream_output=True,
+                stream_display=lambda _name, _line: None,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertGreaterEqual(elapsed, 1.25)
+        self.assertLess(elapsed, 4)
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
     def test_cooperative_timeout_stays_sigterm_and_reaps_during_grace(self) -> None:
