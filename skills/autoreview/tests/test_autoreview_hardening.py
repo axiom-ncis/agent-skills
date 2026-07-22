@@ -4874,6 +4874,54 @@ time.sleep(1.5)
         self.assertGreaterEqual(elapsed, 1.25)
         self.assertLess(elapsed, 4)
 
+    def test_streaming_normal_exit_during_slow_display_is_not_a_timeout(self) -> None:
+        def slow_display(_name: str, _line: str) -> None:
+            time.sleep(0.2)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", "print('normal-before-deadline', flush=True)"],
+                Path(tempdir),
+                label="stream-normal-drain",
+                heartbeat_seconds=0.01,
+                timeout_seconds=0.1,
+                termination_grace_seconds=0.1,
+                stream_output=True,
+                stream_display=slow_display,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertIn("normal-before-deadline", result.stdout)
+
+    def test_streaming_timeout_preserves_lines_queued_before_drain_deadline(self) -> None:
+        producer_source = """
+import time
+
+for index in range(200):
+    print(f'queued-line-{index}', flush=True)
+time.sleep(60)
+"""
+
+        def slow_display(_name: str, _line: str) -> None:
+            time.sleep(0.05)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", producer_source],
+                Path(tempdir),
+                label="stream-timeout-queue-drain",
+                heartbeat_seconds=0.01,
+                timeout_seconds=0.25,
+                termination_grace_seconds=0.1,
+                stream_output=True,
+                stream_display=slow_display,
+            )
+
+        self.assertEqual(result.returncode, self.helper["TIMEOUT_EXIT_CODE"])
+        self.assertTrue(getattr(result, "timed_out"))
+        self.assertIn("queued-line-199", result.stdout)
+
     @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
     def test_cooperative_timeout_stays_sigterm_and_reaps_during_grace(self) -> None:
         parent_source = """

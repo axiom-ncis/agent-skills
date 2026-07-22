@@ -2555,6 +2555,28 @@ def run_with_stream(
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
 
+    def capture_stream_line(name: str, line: str, *, display_output: bool) -> None:
+        if name == "stdout":
+            stdout_parts.append(line)
+        else:
+            stderr_parts.append(line)
+        if not display_output:
+            return
+        display = stream_display(name, line) if stream_display else line
+        if display:
+            target = sys.stdout if name == "stdout" else sys.stderr
+            target.write(stream_display_escape(display))
+            target.flush()
+
+    def drain_queued_stream_lines() -> None:
+        while True:
+            try:
+                name, line = events.get_nowait()
+            except queue.Empty:
+                return
+            if line is not None:
+                capture_stream_line(name, line, display_output=False)
+
     def read_stream(name: str, stream: Any) -> None:
         try:
             try:
@@ -2613,8 +2635,15 @@ def run_with_stream(
                 sys.stderr.write(diagnostic)
                 sys.stderr.flush()
                 drain_deadline = time.monotonic() + max(0.1, termination_grace_seconds)
+            elif leader_returncode is not None and open_streams > 0 and drain_deadline is None:
+                drain_deadline = time.monotonic() + max(0.1, termination_grace_seconds)
             remaining = deadline - time.monotonic()
-            if remaining <= 0 and not timed_out:
+            if (
+                remaining <= 0
+                and not timed_out
+                and proc.poll() is None
+                and managed_process_group_alive(proc)
+            ):
                 timed_out = True
                 termination_action = terminate_managed_process(
                     proc,
@@ -2649,17 +2678,9 @@ def run_with_stream(
                 metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
                 continue
             if line is None:
-                open_streams -= 1
+                open_streams = max(0, open_streams - 1)
                 continue
-            if name == "stdout":
-                stdout_parts.append(line)
-            else:
-                stderr_parts.append(line)
-            display = stream_display(name, line) if stream_display else line
-            if display:
-                target = sys.stdout if name == "stdout" else sys.stderr
-                target.write(stream_display_escape(display))
-                target.flush()
+            capture_stream_line(name, line, display_output=True)
 
         for thread in threads:
             thread.join(timeout=max(0.25, termination_grace_seconds))
@@ -2673,6 +2694,7 @@ def run_with_stream(
                         pass
             for thread in threads:
                 thread.join(timeout=0.25)
+        drain_queued_stream_lines()
         stdin_thread.join(timeout=1)
         for stream in (proc.stdout, proc.stderr):
             if stream is not None and not stream.closed:
