@@ -251,6 +251,30 @@ runner.
 
 Tradeoff: tests may force code changes that stale the review. If tests or review lead to code edits, rerun the affected tests and rerun review until no accepted/actionable findings remain. Once that rerun exits cleanly, stop; do not spend another long review cycle on redundant confirmation.
 
+Every review engine and parallel-test command runs in its own POSIX process
+group or Windows Job Object. On Linux the helper acts as a child subreaper so
+killed grandchildren are reaped instead of left to container PID 1. The helper
+applies a 45-minute hard timeout to each review-engine process and a
+45-minute hard timeout to parallel tests, sends a graceful termination to the
+whole group, waits five seconds, then force-terminates and reaps survivors.
+Timeout diagnostics retain buffered stdout/stderr, the timeout classification,
+the strongest termination action, and the child return code. Override the
+bounds with `--review-timeout-seconds`, `--parallel-tests-timeout-seconds`, and
+`--termination-grace-seconds`, or the corresponding
+`AUTOREVIEW_REVIEW_TIMEOUT_SECONDS`,
+`AUTOREVIEW_PARALLEL_TESTS_TIMEOUT_SECONDS`, and
+`AUTOREVIEW_TERMINATION_GRACE_SECONDS` environment variables.
+
+On WSL, the helper also runs inside a transient `systemd --user` service with
+`KillMode=control-group`, bounded stop escalation, a dead-man runtime limit, and
+automatic collection. This cgroup boundary contains descendants that call
+`setsid()` or otherwise leave the leader's POSIX process group. Environment
+values are transferred by name rather than placed in command arguments, and a
+private one-shot result record preserves the helper's real exit classification
+when systemd must kill a leftover descendant. Post-timeout pipe draining is
+bounded, so a detached process holding stdout or stderr cannot defeat the hard
+timeout. WSL execution fails closed when the user service manager is unavailable.
+
 ## Review Panels
 
 Run multiple reviewers against one frozen bundle:

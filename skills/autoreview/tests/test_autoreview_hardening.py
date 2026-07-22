@@ -4545,6 +4545,510 @@ class AutoreviewHardeningTests(unittest.TestCase):
             release.set()
             stderr_thread.join(timeout=1)
 
+    def test_managed_parallel_test_waits_for_stderr_eof_after_tree_exit(self) -> None:
+        relayed: list[str] = []
+
+        def delayed_relay() -> None:
+            time.sleep(0.4)
+            relayed.append("stderr-tail")
+
+        stderr_thread = threading.Thread(target=delayed_relay, daemon=True)
+        stderr_thread.start()
+        with tempfile.TemporaryDirectory() as tempdir:
+            test_home = Path(tempdir) / "test-home"
+            test_home.mkdir()
+            proc = mock.Mock()
+            proc.pid = 321
+            proc.returncode = 0
+            proc.wait.return_value = 0
+            proc.stderr = io.StringIO("")
+            setattr(proc, "_autoreview_test_home", test_home)
+            setattr(proc, "_autoreview_stderr_thread", stderr_thread)
+            setattr(proc, "_autoreview_managed", True)
+            setattr(proc, "_autoreview_timed_out", False)
+            setattr(proc, "_autoreview_descendant_leak", False)
+            setattr(proc, "_autoreview_termination_action", None)
+            setattr(proc, "_autoreview_termination_grace_seconds", 0.05)
+
+            before = time.monotonic()
+            with mock.patch.dict(
+                self.helper["finish_parallel_tests"].__globals__,
+                {"managed_process_group_alive": lambda _proc: False},
+            ), mock.patch.dict(
+                self.helper["unregister_managed_process"].__globals__,
+                {"close_windows_job": lambda _proc: None},
+            ):
+                result = self.helper["finish_parallel_tests"](proc, time.time())
+            elapsed = time.monotonic() - before
+
+        self.assertEqual(result, 0)
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertEqual(relayed, ["stderr-tail"])
+        self.assertFalse(stderr_thread.is_alive())
+
+    @unittest.skipIf(os.name == "nt", "POSIX waitpid ownership")
+    def test_descendant_reaper_never_reaps_popen_leader(self) -> None:
+        leader_status = mock.Mock(si_pid=101)
+        waitid = mock.Mock(return_value=leader_status)
+        waitpid = mock.Mock()
+        with mock.patch.dict(
+            self.helper["reap_posix_process_group"].__globals__,
+            {"POSIX_SUBREAPER_ENABLED": True},
+        ), mock.patch("os.waitid", waitid), mock.patch("os.waitpid", waitpid):
+            self.helper["reap_posix_process_group"](
+                101,
+                0,
+                leader_pid=101,
+            )
+        waitid.assert_called_once_with(
+            os.P_PGID,
+            101,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        waitpid.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX waitpid ownership")
+    def test_descendant_reaper_uses_process_group_wait_without_procfs(self) -> None:
+        child_status = mock.Mock(si_pid=202)
+        waitid = mock.Mock(side_effect=[child_status, None])
+        waitpid = mock.Mock(return_value=(202, 0))
+        with mock.patch.dict(
+            self.helper["reap_posix_process_group"].__globals__,
+            {"POSIX_SUBREAPER_ENABLED": True},
+        ), mock.patch("os.waitid", waitid), mock.patch("os.waitpid", waitpid):
+            self.helper["reap_posix_process_group"](
+                101,
+                0,
+                leader_pid=101,
+            )
+        waitpid.assert_called_once_with(202, os.WNOHANG)
+
+    def test_managed_process_platform_flags_cover_posix_and_native_windows(self) -> None:
+        self.assertEqual(
+            self.helper["managed_popen_kwargs"]("posix"),
+            {"start_new_session": True},
+        )
+        self.assertEqual(
+            self.helper["managed_popen_kwargs"]("nt"),
+            {"creationflags": 0x00000204},
+        )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux")
+        and "microsoft" in os.uname().release.casefold()
+        and Path("/usr/bin/systemd-run").is_file(),
+        "WSL systemd-user integration",
+    )
+    def test_wsl_systemd_self_test_kills_escaped_setsid_child(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--self-test-process-lifecycle"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        combined = f"{result.stdout}\n{result.stderr}"
+        match = re.search(r"escaped_child_pid=(\d+)", combined)
+        self.assertIsNotNone(match, combined)
+        escaped_pid = int(match.group(1))
+        self.assertFalse(self.helper["process_exists"](escaped_pid))
+        self.assertIn("escaped_pipes_drained=False", combined)
+        self.assertIn("stderr=preserved descendants=0", combined)
+
+    def test_declared_systemd_containment_must_match_current_cgroup(self) -> None:
+        verify = self.helper["verify_declared_systemd_containment"]
+        with mock.patch.dict(
+            verify.__globals__,
+            {"current_unified_cgroup": lambda: "/user.slice/example.service"},
+        ), mock.patch.dict(
+            os.environ,
+            {
+                self.helper["SYSTEMD_CONTAINMENT_ENV"]: "1",
+                self.helper["SYSTEMD_UNIT_ENV"]: "different.service",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(SystemExit, "does not match"):
+                verify()
+
+    def test_systemd_runtime_budget_covers_every_bounded_review_pass(self) -> None:
+        args = argparse.Namespace(
+            review_timeout_seconds=10,
+            parallel_tests_timeout_seconds=100,
+            termination_grace_seconds=5,
+        )
+
+        result = self.helper["systemd_runtime_max_seconds"](args)
+
+        self.assertEqual(
+            result,
+            max(
+                10
+                * self.helper["MAX_REVIEW_PASSES"]
+                * self.helper["MAX_REVIEW_ATTEMPTS_PER_PASS"],
+                100,
+            )
+            + 5
+            + 600,
+        )
+
+    def test_systemd_253_fails_closed_without_secret_safe_environment_transfer(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "version 254 or newer"):
+            self.helper["systemd_command_expansion_compatibility"](
+                253,
+                ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"],
+            )
+
+    def test_systemd_254_disables_expansion_and_preserves_payload(self) -> None:
+        original = ["/tmp/$repo/autoreview", "--prompt=$HOME", "plain"]
+
+        options, payload = self.helper["systemd_command_expansion_compatibility"](
+            254,
+            original,
+        )
+
+        self.assertEqual(options, ["--expand-environment=no"])
+        self.assertIs(payload, original)
+
+    def test_systemd_run_version_fails_closed_on_unrecognized_output(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["systemd-run", "--version"],
+            0,
+            "unknown service manager\n",
+            "",
+        )
+        with mock.patch("subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "unrecognized version output"):
+                self.helper["systemd_run_version"]()
+
+    def test_unsupported_systemd_version_fails_before_result_staging(self) -> None:
+        enter = self.helper["enter_wsl_systemd_containment"]
+        args = argparse.Namespace()
+        with mock.patch.dict(
+            enter.__globals__,
+            {
+                "SYSTEMD_RUN_PATH": Path(sys.executable),
+                "SYSTEMCTL_PATH": Path(sys.executable),
+                "verify_declared_systemd_containment": lambda: False,
+                "wsl_runtime": lambda: True,
+                "systemd_run_version": lambda: 253,
+            },
+        ), mock.patch("tempfile.mkdtemp") as mkdtemp:
+            with self.assertRaisesRegex(SystemExit, "version 254 or newer"):
+                enter(args)
+        mkdtemp.assert_not_called()
+
+    def test_systemd_query_failure_is_not_treated_as_inactive(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["systemctl"],
+            1,
+            "",
+            "Failed to connect to bus",
+        )
+        with mock.patch("subprocess.run", return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, "Failed to connect to bus"):
+                self.helper["systemd_unit_active"]("autoreview-test.service")
+
+    def test_review_engine_normal_completion_is_reaped(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", "print('managed-normal')"],
+                Path(tempdir),
+                label="managed-normal",
+                heartbeat_seconds=1,
+                timeout_seconds=5,
+                termination_grace_seconds=1,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "managed-normal")
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_review_engine_timeout_kills_term_ignoring_grandchild_and_keeps_stderr(self) -> None:
+        parent_source = """
+import signal
+import subprocess
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([
+    sys.executable,
+    '-c',
+    'import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+    'print(\"grandchild-ready\", file=sys.stderr, flush=True); time.sleep(60)',
+])
+print(f'grandchild-pid={child.pid}', file=sys.stderr, flush=True)
+time.sleep(60)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", parent_source],
+                Path(tempdir),
+                label="managed-timeout",
+                heartbeat_seconds=1,
+                timeout_seconds=1,
+                termination_grace_seconds=1,
+            )
+        self.assertEqual(result.returncode, self.helper["TIMEOUT_EXIT_CODE"])
+        self.assertTrue(getattr(result, "timed_out"))
+        self.assertEqual(getattr(result, "termination_action"), "SIGKILL")
+        self.assertIn("grandchild-ready", result.stderr)
+        self.assertIn("timed out after 1s", result.stderr)
+        match = re.search(r"grandchild-pid=(\d+)", result.stderr)
+        self.assertIsNotNone(match)
+        grandchild_pid = int(match.group(1))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(grandchild_pid, 0)
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_exited_engine_leader_cleans_descendant_without_waiting_for_hard_timeout(self) -> None:
+        leader_source = """
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(f'lingering-pid={child.pid}', file=sys.stderr, flush=True)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            started = time.monotonic()
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", leader_source],
+                Path(tempdir),
+                label="leader-exit",
+                heartbeat_seconds=1,
+                timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, self.helper["DESCENDANT_LEAK_EXIT_CODE"])
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertLess(elapsed, 4)
+        self.assertIn("leader exited but descendants survived", result.stderr)
+        lingering_pid = int(re.search(r"lingering-pid=(\d+)", result.stderr).group(1))
+        self.assertFalse(self.helper["process_exists"](lingering_pid))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_streaming_exited_leader_cleans_descendant_before_pipe_eof(self) -> None:
+        leader_source = """
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(f'stream-lingering-pid={child.pid}', file=sys.stderr, flush=True)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", leader_source],
+                Path(tempdir),
+                label="stream-leader-exit",
+                heartbeat_seconds=1,
+                timeout_seconds=10,
+                termination_grace_seconds=1,
+                stream_output=True,
+                stream_display=lambda _name, _line: None,
+            )
+        self.assertEqual(result.returncode, self.helper["DESCENDANT_LEAK_EXIT_CODE"])
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertIn("leader exited but descendants survived", result.stderr)
+        lingering_pid = int(re.search(r"stream-lingering-pid=(\d+)", result.stderr).group(1))
+        self.assertFalse(self.helper["process_exists"](lingering_pid))
+
+    def test_streaming_engine_may_close_both_pipes_before_normal_exit(self) -> None:
+        leader_source = """
+import os
+import time
+
+os.close(1)
+os.close(2)
+time.sleep(1.5)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            started = time.monotonic()
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", leader_source],
+                Path(tempdir),
+                label="stream-early-eof",
+                heartbeat_seconds=0.1,
+                timeout_seconds=5,
+                termination_grace_seconds=0.1,
+                stream_output=True,
+                stream_display=lambda _name, _line: None,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertGreaterEqual(elapsed, 1.25)
+        self.assertLess(elapsed, 4)
+
+    def test_streaming_normal_exit_during_slow_display_is_not_a_timeout(self) -> None:
+        def slow_display(_name: str, _line: str) -> None:
+            time.sleep(0.2)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", "print('normal-before-deadline', flush=True)"],
+                Path(tempdir),
+                label="stream-normal-drain",
+                heartbeat_seconds=0.01,
+                timeout_seconds=0.1,
+                termination_grace_seconds=0.1,
+                stream_output=True,
+                stream_display=slow_display,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(getattr(result, "timed_out"))
+        self.assertIn("normal-before-deadline", result.stdout)
+
+    def test_streaming_timeout_preserves_lines_queued_before_drain_deadline(self) -> None:
+        producer_source = """
+import time
+
+for index in range(200):
+    print(f'queued-line-{index}', flush=True)
+time.sleep(60)
+"""
+
+        def slow_display(_name: str, _line: str) -> None:
+            time.sleep(0.05)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", producer_source],
+                Path(tempdir),
+                label="stream-timeout-queue-drain",
+                heartbeat_seconds=0.01,
+                timeout_seconds=0.25,
+                termination_grace_seconds=0.1,
+                stream_output=True,
+                stream_display=slow_display,
+            )
+
+        self.assertEqual(result.returncode, self.helper["TIMEOUT_EXIT_CODE"])
+        self.assertTrue(getattr(result, "timed_out"))
+        self.assertIn("queued-line-199", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_cooperative_timeout_stays_sigterm_and_reaps_during_grace(self) -> None:
+        parent_source = """
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(f'cooperative-pid={child.pid}', file=sys.stderr, flush=True)
+time.sleep(60)
+"""
+        with tempfile.TemporaryDirectory() as tempdir:
+            started = time.monotonic()
+            result = self.helper["run_with_heartbeat"](
+                [sys.executable, "-c", parent_source],
+                Path(tempdir),
+                label="cooperative-timeout",
+                heartbeat_seconds=1,
+                timeout_seconds=1,
+                termination_grace_seconds=3,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, self.helper["TIMEOUT_EXIT_CODE"])
+        self.assertEqual(getattr(result, "termination_action"), "SIGTERM")
+        self.assertLess(elapsed, 3)
+        cooperative_pid = int(re.search(r"cooperative-pid=(\d+)", result.stderr).group(1))
+        self.assertFalse(self.helper["process_exists"](cooperative_pid))
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_parallel_test_timeout_kills_complete_shell_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            pid_file = root / "grandchild.pid"
+            fixture = root / "parallel_hang.py"
+            fixture.write_text(
+                "import pathlib,signal,subprocess,sys,time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "child=subprocess.Popen([sys.executable,'-c',"
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            proc, started = self.helper["start_parallel_tests"](
+                f"{sys.executable} {fixture}",
+                repo,
+                "default",
+                timeout_seconds=1,
+                termination_grace_seconds=1,
+            )
+            status = self.helper["finish_parallel_tests"](proc, started)
+            self.assertEqual(status, self.helper["TIMEOUT_EXIT_CODE"])
+            grandchild_pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(grandchild_pid, 0)
+            self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_completed_parallel_test_is_not_timed_out_before_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            fixture = Path(tempdir) / "parallel_success.py"
+            fixture.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            proc, started = self.helper["start_parallel_tests"](
+                f"{sys.executable} {fixture}",
+                repo,
+                "default",
+                timeout_seconds=0.25,
+                termination_grace_seconds=1,
+            )
+            time.sleep(0.6)
+            status = self.helper["finish_parallel_tests"](proc, started)
+
+        self.assertEqual(status, 0)
+        self.assertFalse(getattr(proc, "_autoreview_timed_out"))
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group integration")
+    def test_parallel_leader_exit_cleans_descendant_before_hard_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            pid_file = root / "parallel_leader_exit.pid"
+            fixture = root / "parallel_leader_exit.py"
+            fixture.write_text(
+                "import pathlib,subprocess,sys\n"
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n",
+                encoding="utf-8",
+            )
+            started_at = time.monotonic()
+            proc, started = self.helper["start_parallel_tests"](
+                f"{sys.executable} {fixture}",
+                repo,
+                "default",
+                timeout_seconds=10,
+                termination_grace_seconds=1,
+            )
+            deadline = time.monotonic() + 4
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text())
+            while self.helper["process_exists"](child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self.helper["process_exists"](child_pid))
+            self.assertLess(time.monotonic() - started_at, 4)
+            status = self.helper["finish_parallel_tests"](proc, started)
+
+        self.assertEqual(status, self.helper["DESCENDANT_LEAK_EXIT_CODE"])
+        self.assertFalse(getattr(proc, "_autoreview_timed_out"))
+        self.assertTrue(getattr(proc, "_autoreview_descendant_leak"))
+        self.assertEqual(self.helper["ACTIVE_MANAGED_PROCESSES"], {})
+
     def test_source_tree_snapshot_detects_parallel_test_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
