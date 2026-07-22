@@ -4633,6 +4633,46 @@ class AutoreviewHardeningTests(unittest.TestCase):
             {"creationflags": 0x00000204},
         )
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux")
+        and "microsoft" in os.uname().release.casefold()
+        and Path("/usr/bin/systemd-run").is_file(),
+        "WSL systemd-user integration",
+    )
+    def test_wsl_systemd_self_test_kills_escaped_setsid_child(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--self-test-process-lifecycle"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        combined = f"{result.stdout}\n{result.stderr}"
+        match = re.search(r"escaped_child_pid=(\d+)", combined)
+        self.assertIsNotNone(match, combined)
+        escaped_pid = int(match.group(1))
+        self.assertFalse(self.helper["process_exists"](escaped_pid))
+        self.assertIn("escaped_pipes_drained=False", combined)
+        self.assertIn("stderr=preserved descendants=0", combined)
+
+    def test_declared_systemd_containment_must_match_current_cgroup(self) -> None:
+        verify = self.helper["verify_declared_systemd_containment"]
+        with mock.patch.dict(
+            verify.__globals__,
+            {"current_unified_cgroup": lambda: "/user.slice/example.service"},
+        ), mock.patch.dict(
+            os.environ,
+            {
+                self.helper["SYSTEMD_CONTAINMENT_ENV"]: "1",
+                self.helper["SYSTEMD_UNIT_ENV"]: "different.service",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(SystemExit, "does not match"):
+                verify()
+
     def test_review_engine_normal_completion_is_reaped(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             result = self.helper["run_with_heartbeat"](

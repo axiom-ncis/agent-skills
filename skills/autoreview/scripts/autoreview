@@ -44,6 +44,12 @@ TIMEOUT_EXIT_CODE = 124
 DESCENDANT_LEAK_EXIT_CODE = 70
 ACTIVE_MANAGED_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 POSIX_SUBREAPER_ENABLED = False
+SYSTEMD_RUN_PATH = Path('/usr/bin/systemd-run')
+SYSTEMCTL_PATH = Path('/usr/bin/systemctl')
+SYSTEMD_UNIT_ENV = 'AUTOREVIEW_SYSTEMD_UNIT'
+SYSTEMD_CONTAINMENT_ENV = 'AUTOREVIEW_SYSTEMD_CONTAINMENT'
+SYSTEMD_RESULT_PATH_ENV = 'AUTOREVIEW_SYSTEMD_RESULT_PATH'
+DECLARED_SYSTEMD_RESULT_PATH = os.environ.pop(SYSTEMD_RESULT_PATH_ENV, None)
 SAFE_GIT_CONFIG_ARGS = (
     "-c",
     "core.fsmonitor=false",
@@ -1629,6 +1635,242 @@ def positive_seconds(value: str) -> int:
     return seconds
 
 
+def wsl_runtime() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(
+            encoding="utf-8"
+        ).casefold()
+    except OSError:
+        return False
+
+
+def current_unified_cgroup() -> str | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            if line.startswith("0::"):
+                return line[3:]
+    except OSError:
+        return None
+    return None
+
+
+def verify_declared_systemd_containment() -> bool:
+    declared = os.environ.get(SYSTEMD_CONTAINMENT_ENV)
+    unit = os.environ.get(SYSTEMD_UNIT_ENV)
+    if not declared and not unit:
+        return False
+    if declared != "1" or not unit or not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", unit):
+        raise SystemExit("invalid Autoreview systemd containment declaration")
+    cgroup = current_unified_cgroup()
+    if not cgroup or PurePosixPath(cgroup).name != unit:
+        raise SystemExit(
+            "Autoreview systemd containment declaration does not match /proc/self/cgroup"
+        )
+    return True
+
+
+def systemd_unit_active(unit: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                str(SYSTEMCTL_PATH),
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                unit,
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot query Autoreview systemd unit {unit}: {exc}") from exc
+    state = result.stdout.strip()
+    return state in {"active", "activating", "reloading", "deactivating"}
+
+
+def signal_systemd_unit(unit: str, signal_name: str) -> None:
+    if not systemd_unit_active(unit):
+        return
+    try:
+        result = subprocess.run(
+            [
+                str(SYSTEMCTL_PATH),
+                "--user",
+                "kill",
+                "--kill-whom=all",
+                f"--signal={signal_name}",
+                unit,
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot signal Autoreview systemd unit {unit}: {exc}") from exc
+    if result.returncode != 0 and systemd_unit_active(unit):
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"cannot signal Autoreview systemd unit {unit}: {detail}")
+
+
+def terminate_systemd_unit(unit: str, grace_seconds: int) -> str:
+    action = "none"
+    if systemd_unit_active(unit):
+        signal_systemd_unit(unit, "SIGTERM")
+        action = "systemd-SIGTERM"
+    deadline = time.monotonic() + grace_seconds
+    while systemd_unit_active(unit) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if systemd_unit_active(unit):
+        signal_systemd_unit(unit, "SIGKILL")
+        action = "systemd-SIGKILL"
+        deadline = time.monotonic() + max(1, grace_seconds)
+        while systemd_unit_active(unit) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    return action
+
+
+def systemd_environment_names(env: dict[str, str]) -> list[str]:
+    return sorted(
+        name
+        for name, value in env.items()
+        if value is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+    )
+
+
+def read_systemd_result(path: Path, unit: str) -> int | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("unit") != unit
+        or not isinstance(payload.get("exit_code"), int)
+        or not 0 <= payload["exit_code"] <= 255
+    ):
+        return None
+    return int(payload["exit_code"])
+
+
+def record_systemd_result(exit_code: int) -> None:
+    if not DECLARED_SYSTEMD_RESULT_PATH:
+        return
+    unit = os.environ.get(SYSTEMD_UNIT_ENV)
+    if not unit or not verify_declared_systemd_containment():
+        raise RuntimeError("cannot record Autoreview result outside declared systemd containment")
+    result_path = Path(DECLARED_SYSTEMD_RESULT_PATH)
+    if not result_path.is_absolute() or result_path.name != "result.json":
+        raise RuntimeError("invalid Autoreview systemd result path")
+    atomic_write_text(
+        result_path,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "unit": unit,
+                "exit_code": int(exit_code),
+                "pid": os.getpid(),
+                "cgroup": current_unified_cgroup(),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def enter_wsl_systemd_containment(args: argparse.Namespace) -> int | None:
+    if verify_declared_systemd_containment() or not wsl_runtime():
+        return None
+    if not SYSTEMD_RUN_PATH.is_file() or not os.access(SYSTEMD_RUN_PATH, os.X_OK):
+        raise SystemExit(f"required WSL lifecycle containment is unavailable: {SYSTEMD_RUN_PATH}")
+    if not SYSTEMCTL_PATH.is_file() or not os.access(SYSTEMCTL_PATH, os.X_OK):
+        raise SystemExit(f"required WSL lifecycle containment is unavailable: {SYSTEMCTL_PATH}")
+
+    suffix = hashlib.sha256(
+        f"{Path.cwd().resolve()}\0{os.getpid()}\0{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:12]
+    unit = f"autoreview-{os.getpid()}-{suffix}.service"
+    env = os.environ.copy()
+    env[SYSTEMD_UNIT_ENV] = unit
+    env[SYSTEMD_CONTAINMENT_ENV] = "1"
+    runtime_root = Path(env.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    result_root = Path(
+        tempfile.mkdtemp(prefix="autoreview-systemd-result-", dir=runtime_root)
+    )
+    result_root.chmod(0o700)
+    result_path = result_root / "result.json"
+    env[SYSTEMD_RESULT_PATH_ENV] = str(result_path)
+    maximum_command_timeout = max(
+        int(args.review_timeout_seconds),
+        int(args.parallel_tests_timeout_seconds),
+    )
+    runtime_max_seconds = (maximum_command_timeout * 4) + int(
+        args.termination_grace_seconds
+    ) + 600
+    command = [
+        str(SYSTEMD_RUN_PATH),
+        "--user",
+        "--quiet",
+        "--pipe",
+        "--wait",
+        "--collect",
+        "--service-type=exec",
+        "--expand-environment=no",
+        f"--unit={unit}",
+        "--property=KillMode=control-group",
+        f"--property=TimeoutStopSec={args.termination_grace_seconds}s",
+        "--property=SendSIGKILL=yes",
+        f"--property=RuntimeMaxSec={runtime_max_seconds}s",
+        f"--working-directory={Path.cwd().resolve()}",
+        *(f"--setenv={name}" for name in systemd_environment_names(env)),
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+    ]
+    proc = subprocess.Popen(command, env=env, start_new_session=True)
+    previous_handlers: dict[int, Any] = {}
+    interrupted: dict[str, int | None] = {"signal": None}
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        if interrupted["signal"] is not None:
+            return
+        interrupted["signal"] = signum
+        terminate_systemd_unit(unit, int(args.termination_grace_seconds))
+
+    for signal_name in ("SIGHUP", "SIGINT", "SIGTERM"):
+        signum = getattr(signal, signal_name, None)
+        if signum is not None:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_signal)
+    recorded_status: int | None = None
+    try:
+        returncode = proc.wait()
+    except BaseException:
+        terminate_systemd_unit(unit, int(args.termination_grace_seconds))
+        raise
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if systemd_unit_active(unit):
+            terminate_systemd_unit(unit, int(args.termination_grace_seconds))
+        recorded_status = read_systemd_result(result_path, unit)
+        shutil.rmtree(result_root, ignore_errors=True)
+    if interrupted["signal"] is not None:
+        return 128 + int(interrupted["signal"])
+    return recorded_status if recorded_status is not None else int(returncode)
+
+
 def managed_popen_kwargs(platform_name: str | None = None) -> dict[str, Any]:
     platform_name = platform_name or os.name
     if platform_name == "nt":
@@ -2009,6 +2251,38 @@ def terminate_managed_process(
     return action
 
 
+def subprocess_output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS)
+    return value
+
+
+def bounded_communicate(
+    proc: subprocess.Popen[Any],
+    *,
+    input_text: str | None = None,
+    timeout_seconds: int | float,
+) -> tuple[str, str, bool]:
+    try:
+        stdout, stderr = proc.communicate(
+            input=input_text,
+            timeout=max(0.1, float(timeout_seconds)),
+        )
+        return stdout or "", stderr or "", True
+    except subprocess.TimeoutExpired as exc:
+        stdout = subprocess_output_text(exc.output)
+        stderr = subprocess_output_text(exc.stderr)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return stdout, stderr, False
+
+
 def lifecycle_result(
     args: list[str],
     returncode: int,
@@ -2101,10 +2375,14 @@ def run_with_heartbeat(
                     label=label,
                     grace_seconds=termination_grace_seconds,
                 )
-                stdout, stderr = proc.communicate()
+                stdout, stderr, drained = bounded_communicate(
+                    proc,
+                    timeout_seconds=termination_grace_seconds,
+                )
                 diagnostic = (
                     f"autoreview lifecycle: {label} timed out after {timeout_seconds}s; "
-                    f"termination={action}; process_returncode={proc.returncode}\n"
+                    f"termination={action}; process_returncode={proc.returncode}; "
+                    f"pipes_drained={str(drained).lower()}\n"
                 )
                 return lifecycle_result(
                     args,
@@ -2129,10 +2407,14 @@ def run_with_heartbeat(
                         label=f"{label} descendant cleanup",
                         grace_seconds=termination_grace_seconds,
                     )
-                    stdout, stderr = proc.communicate()
+                    stdout, stderr, drained = bounded_communicate(
+                        proc,
+                        timeout_seconds=termination_grace_seconds,
+                    )
                     diagnostic = (
                         f"autoreview lifecycle: {label} leader exited but descendants survived; "
-                        f"termination={action}; process_returncode={leader_returncode}\n"
+                        f"termination={action}; process_returncode={leader_returncode}; "
+                        f"pipes_drained={str(drained).lower()}\n"
                     )
                     return lifecycle_result(
                         args,
@@ -2221,8 +2503,11 @@ def run_with_stream(
 
     def read_stream(name: str, stream: Any) -> None:
         try:
-            for line in iter(stream.readline, ""):
-                events.put((name, line))
+            try:
+                for line in iter(stream.readline, ""):
+                    events.put((name, line))
+            except (OSError, ValueError):
+                pass
         finally:
             events.put((name, None))
 
@@ -2248,6 +2533,8 @@ def run_with_stream(
     timed_out = False
     descendant_leak = False
     termination_action: str | None = None
+    drain_deadline: float | None = None
+    pipes_drained = True
     try:
         open_streams = 2
         while open_streams:
@@ -2271,6 +2558,7 @@ def run_with_stream(
                 stderr_parts.append(diagnostic)
                 sys.stderr.write(diagnostic)
                 sys.stderr.flush()
+                drain_deadline = time.monotonic() + max(0.1, termination_grace_seconds)
             remaining = deadline - time.monotonic()
             if remaining <= 0 and not timed_out:
                 timed_out = True
@@ -2286,7 +2574,19 @@ def run_with_stream(
                 stderr_parts.append(diagnostic)
                 sys.stderr.write(diagnostic)
                 sys.stderr.flush()
+                drain_deadline = time.monotonic() + max(0.1, termination_grace_seconds)
+            if drain_deadline is not None and time.monotonic() >= drain_deadline:
+                pipes_drained = False
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None and not stream.closed:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                break
             wait_seconds = heartbeat_seconds if timed_out else min(heartbeat_seconds, max(0.01, remaining))
+            if drain_deadline is not None:
+                wait_seconds = min(wait_seconds, max(0.01, drain_deadline - time.monotonic()))
             try:
                 name, line = events.get(timeout=wait_seconds)
             except queue.Empty:
@@ -2306,12 +2606,34 @@ def run_with_stream(
                 target.flush()
 
         for thread in threads:
-            thread.join()
+            thread.join(timeout=max(0.25, termination_grace_seconds))
+        if any(thread.is_alive() for thread in threads):
+            pipes_drained = False
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            for thread in threads:
+                thread.join(timeout=0.25)
         stdin_thread.join(timeout=1)
         for stream in (proc.stdout, proc.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
-        process_returncode = proc.wait()
+        try:
+            process_returncode = proc.wait(timeout=max(1, termination_grace_seconds))
+        except subprocess.TimeoutExpired:
+            process_returncode = proc.poll()
+            pipes_drained = False
+        if not pipes_drained:
+            diagnostic = (
+                f"autoreview lifecycle: {label} pipe drain exceeded "
+                f"{termination_grace_seconds}s; pipes_drained=false\n"
+            )
+            stderr_parts.append(diagnostic)
+            sys.stderr.write(diagnostic)
+            sys.stderr.flush()
         if not timed_out and not descendant_leak and managed_process_group_alive(proc):
             termination_action = terminate_managed_process(
                 proc,
@@ -2330,7 +2652,7 @@ def run_with_stream(
             elif descendant_leak:
                 returncode = DESCENDANT_LEAK_EXIT_CODE
             else:
-                returncode = process_returncode
+                returncode = int(process_returncode or 0)
         return lifecycle_result(
             args,
             returncode,
@@ -11788,13 +12110,17 @@ def relay_parallel_test_stderr(stream: Any, java_tool_options: str) -> None:
         f"NOTE: Picked up JAVA_TOOL_OPTIONS: {java_tool_options}",
     }
     try:
-        for line in stream:
-            if line.rstrip("\r\n") in suppressed:
-                continue
-            sys.stderr.write(line)
-            sys.stderr.flush()
+        try:
+            for line in stream:
+                if line.rstrip("\r\n") in suppressed:
+                    continue
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
     finally:
-        stream.close()
+        if not stream.closed:
+            stream.close()
 
 
 def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
@@ -11861,12 +12187,9 @@ def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
             )
         stderr_thread = getattr(proc, "_autoreview_stderr_thread", None)
         if isinstance(stderr_thread, threading.Thread):
-            if managed and not tree_alive:
-                # With the complete tree gone, the pipe must reach EOF. Do not
-                # abandon buffered diagnostics merely because relaying them is
-                # slower than the process-termination grace period.
-                stderr_thread.join()
-            else:
+            stderr_thread.join(timeout=lifecycle_join_seconds if managed else 0.25)
+            if stderr_thread.is_alive() and proc.stderr is not None and not proc.stderr.closed:
+                proc.stderr.close()
                 stderr_thread.join(timeout=0.25)
         stderr_drain_failed = bool(
             managed
@@ -12677,6 +13000,54 @@ time.sleep(60)
             f"grandchild {grandchild_pid} survived"
         )
     timeout_result: subprocess.CompletedProcess[str] | None = None
+    escaped_child_pid: int | None = None
+    escaped_pipes_drained: bool | None = None
+    if os.name != "nt" and verify_declared_systemd_containment():
+        escaped_engine = """
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([
+    sys.executable,
+    '-c',
+    'import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+    'print("escaped-child-ready", file=sys.stderr, flush=True); time.sleep(60)',
+], start_new_session=True)
+print(f'escaped-child-pid={child.pid}', file=sys.stderr, flush=True)
+time.sleep(60)
+"""
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="autoreview-escaped-self-test.") as tempdir:
+            escaped_result = run_with_heartbeat(
+                [sys.executable, "-c", escaped_engine],
+                Path(tempdir),
+                label="fake-engine-escaped-canary",
+                heartbeat_seconds=1,
+                timeout_seconds=2,
+                termination_grace_seconds=1,
+            )
+        elapsed = time.monotonic() - started
+        escaped_match = re.search(r"escaped-child-pid=(\d+)", escaped_result.stderr)
+        escaped_child_pid = int(escaped_match.group(1)) if escaped_match else None
+        escaped_pipes_drained = "pipes_drained=true" in escaped_result.stderr
+        if (
+            escaped_result.returncode != TIMEOUT_EXIT_CODE
+            or not getattr(escaped_result, "timed_out", False)
+            or escaped_child_pid is None
+            or "escaped-child-ready" not in escaped_result.stderr
+            or elapsed > 6
+        ):
+            raise SystemExit(
+                "autoreview process lifecycle self-test failed: escaped child hard timeout "
+                f"returncode={escaped_result.returncode} elapsed={elapsed:.2f}s "
+                f"stderr={escaped_result.stderr!r}"
+            )
+        if not process_exists(escaped_child_pid):
+            raise SystemExit(
+                "autoreview process lifecycle self-test failed: escaped child fixture "
+                "did not outlive process-group cleanup"
+            )
     if os.name == "nt":
         timeout_engine = """
 import subprocess
@@ -12729,6 +13100,8 @@ time.sleep(60)
         f"process_returncode={getattr(result, 'process_returncode', None)} "
         f"windows_timeout={getattr(timeout_result, 'timed_out', None)} "
         f"windows_timeout_termination={getattr(timeout_result, 'termination_action', None)} "
+        f"escaped_child_pid={escaped_child_pid} "
+        f"escaped_pipes_drained={escaped_pipes_drained} "
         "stderr=preserved descendants=0"
     )
     return 0
@@ -12780,6 +13153,9 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 def main() -> int:
     args = parse_args()
+    contained_status = enter_wsl_systemd_containment(args)
+    if contained_status is not None:
+        return contained_status
     install_managed_signal_handlers(args.termination_grace_seconds)
     if args.self_test:
         return self_test()
@@ -12974,4 +13350,11 @@ def sanitized_main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(sanitized_main())
+    try:
+        main_status = sanitized_main()
+    except SystemExit as exc:
+        if isinstance(exc.code, int):
+            record_systemd_result(exc.code)
+        raise
+    record_systemd_result(main_status)
+    raise SystemExit(main_status)
